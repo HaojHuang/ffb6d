@@ -3,10 +3,7 @@
 __author__      = "Haojie"
 __status__ = "incomplete"
 
-from data_robot.VN_RandLANet import Conv2d
-# d_out=100
-# mlp1 = Conv2d(in_size=10,out_size=d_out,kernel_size=(1,1),bn=False)
-# print(mlp1)
+
 #batch * n_points * n_channel*3
 #batch * n_points * n_neighbors * n_channel * 3
 
