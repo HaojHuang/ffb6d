@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Equivariant RandLANet With Vector Neuron"""
-__author__      = "Haojie"
+
 __status__ = "the model is complete"
 
 #batch * n_points * n_channel* 3
