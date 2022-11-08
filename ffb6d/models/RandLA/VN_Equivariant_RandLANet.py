@@ -1,15 +1,16 @@
 #!/usr/bin/env python
 """Equivariant RandLANet With Vector Neuron"""
 __author__      = "Haojie"
-__status__ = "incomplete"
+__status__ = "the model is complete"
 
-
-#batch * n_points * n_channel*3
+#batch * n_points * n_channel* 3
 #batch * n_points * n_neighbors * n_channel * 3
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+from sklearn.metrics import confusion_matrix
 
 def knn(x, k):
     '''
@@ -264,7 +265,7 @@ def vn_random_sample(feature, pool_idx ,pool='average'):
         pool_features = torch.gather(feature, 1, pool_idx.unsqueeze(dim=-1).unsqueeze(dim=-1).repeat(1, 1, d, 3))
     return pool_features
 
-def nearest_interpolation(feature, interp_idx):
+def vn_nearest_interpolation(feature, interp_idx):
     """
     :param feature: [B, npoints, C, 3] input features matrix
     :param interp_idx: [B, up_num_points, 1] nearest neighbour index
@@ -289,6 +290,232 @@ def nearst_neighbor_match(xyz, sample_index):
     return nearest_neighbors, sampled_xyz
 
 
+def preprocess_data(xyz,color=None):
+    '''
+    :param xyz: BxNx3
+    :param color: BXNX3
+    :return: {'feature': BxNx1x3 or  BxNx4x3, 'xyz':[xyz, xyz/4, xyz/16,...],
+                'sub_idx':[BxN/4,BxN/16,...],'interp_idx':[BxN,BxN/4,BxN/16,...],
+                'neigh_idx':[BxNxK,BxN/4xK,BxN/16xK,...]}
+    '''
+    neigh_idx = knn(xyz.transpose(1,2),k=16)
+    if color is None:
+        feature = xyz.unsqueeze(dim=-2)
+        # the input channel will be 1
+    else:
+        color = color.unsqueeze(dim=-1).repeat(1,1,1,3)
+        xyz = xyz.unsqueeze(dim=-2).repeat(1,1,3,1)
+        feature = torch.cat((xyz,color),dim=-2)
+        # the input channel will be 6
+
+    end_points = {'features':feature,'xyz':[xyz,], 'sub_idx':[],'interp_idx':[],'neigh_idx':[neigh_idx,],}
+    for i in range(4):
+        current_pts = end_points['xyz'][-1]
+        sub_idx = torch.randint(high=current_pts.shape[1], size=(current_pts.shape[0], current_pts.shape[1] // 4))
+        interp_idx, sampled_xyz = nearst_neighbor_match(current_pts,sub_idx)
+        end_points['xyz'].append(sampled_xyz)
+        end_points['sub_idx'].append(sub_idx)
+        end_points['interp_idx'].append(interp_idx)
+        if i <3:
+            neigh_idx = knn(sampled_xyz.transpose(1, 2), k=16)
+            end_points['neigh_idx'].append(neigh_idx)
+    return end_points
+
+class ConfigSemanticKitti:
+    in_c = 1  # kitti only have xyz information
+    k_n = 16  # KNN
+    num_layers = 4  # Number of layers
+    num_points = 4096 * 11  # Number of input points
+    num_classes = 19  # Number of valid classes
+    sub_grid_size = 0.06  # preprocess_parameter
+    batch_size = 6  # batch_size during training
+    val_batch_size = 20  # batch_size during validation and test
+    train_steps = 500  # Number of steps per epochs
+    val_steps = 100  # Number of validation steps per epoch
+    sub_sampling_ratio = [4, 4, 4, 4]  # sampling ratio of random sampling at each layer
+    d_out = [16, 64, 128, 256]  # feature dimension
+    num_sub_points = [num_points // 4, num_points // 16, num_points // 64, num_points // 256]
+    noise_init = 3.5  # noise initial parameter
+    max_epoch = 100  # maximum epoch during training
+    learning_rate = 1e-2  # initial learning rate
+    lr_decays = {i: 0.95 for i in range(0, 500)}  # decay rate of learning rate
+    train_sum_dir = 'train_log'
+    saving = True
+    saving_path = None
+
+class Network(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.fc0 = VNLinearLeakyReLU(self.config.in_c, 8, negative_slope=0.2)
+        self.dilated_res_blocks = nn.ModuleList()
+        d_in = 8
+        for i in range(self.config.num_layers):
+            d_out = self.config.d_out[i]
+            self.dilated_res_blocks.append(VN_Dilated_res_block(d_in, d_out))
+            d_in = 2 * d_out
+        d_out = d_in
+        self.decoder_0 = VNLinearLeakyReLU(d_in, d_out,negative_slope=0.2)
+
+        self.decoder_blocks = nn.ModuleList()
+        for j in range(self.config.num_layers):
+            if j < 3:
+                d_in = d_out + 2 * self.config.d_out[-j-2]
+                d_out = 2 * self.config.d_out[-j-2]
+            else:
+                d_in =  4 * self.config.d_out[-4]
+                d_out = 2 * self.config.d_out[-4]
+            self.decoder_blocks.append(VNLinearLeakyReLU(d_in, d_out, negative_slope=0.2))
+
+        self.fc1 = VNLinearLeakyReLU(d_out, 64)
+        self.fc2 = VNLinearLeakyReLU(64, 32,)
+        #TODO transform it to invairant feature
+        self.std = VNStdFeature(in_channels=32)
+        self.dropout = nn.Dropout(0.5)
+        self.fc3 = nn.Linear(96, self.config.num_classes)
+
+    def forward(self, end_points):
+        features = end_points['features']  # Batch*npoints*channel*3
+        features = self.fc0(features)
+        #features = features.unsqueeze(dim=3)  # Batch*channel*npoints*1
+        # ###########################Encoder############################
+        f_encoder_list = []
+        for i in range(self.config.num_layers):
+            #print( i,features.size(),end_points['xyz'][i].unsqueeze(dim=-2).size(),end_points['neigh_idx'][i].size(),end_points['sub_idx'][i].size())
+            f_encoder_i = self.dilated_res_blocks[i](
+                features, end_points['xyz'][i].unsqueeze(dim=-2), end_points['neigh_idx'][i])
+            f_sampled_i = vn_random_sample(f_encoder_i, end_points['sub_idx'][i], pool='direct')
+            features = f_sampled_i
+            print("encoder%d:"%i, features.size())
+            if i == 0:
+                f_encoder_list.append(f_encoder_i)
+            f_encoder_list.append(f_sampled_i)
+        # ###########################Encoder############################
+        features = self.decoder_0(f_encoder_list[-1])
+        print('bottleneck transform:',features.size())
+        # ###########################Decoder############################
+        f_decoder_list = []
+        for j in range(self.config.num_layers):
+            f_interp_i = vn_nearest_interpolation(features, end_points['interp_idx'][-j - 1])
+            f_decoder_i = self.decoder_blocks[j](torch.cat([f_encoder_list[-j - 2], f_interp_i], dim=2))
+            #print(j, features.size(), end_points['interp_idx'][-j - 1].size(),f_interp_i.size(),f_encoder_list[-j - 2].size(),torch.cat([f_encoder_list[-j - 2], f_interp_i], dim=2).size())
+            features = f_decoder_i
+            print("decoder%d:"%j, features.size())
+            f_decoder_list.append(f_decoder_i)
+        # ###########################Decoder############################
+        features = self.fc1(features)
+        features = self.fc2(features)
+        # f_mean_tile = features.mean(dim=1, keepdim=True).expand(features.size())
+        # feature, z0 = self.std(torch.cat((features, f_mean_tile), dim=-2))
+        # get the invariant feature of each point
+        features, z0 = self.std(features)
+        features = torch.flatten(features,start_dim=2)
+        features = self.dropout(features)
+        features = self.fc3(features).transpose(1,2)
+        print('final feature',features.size()) #B x Num_class x N_pts
+        end_points['logits'] = features
+        return end_points
+
+#####################################################################################################################
+def compute_acc(end_points):
+    '''
+       copy from RandLANet
+       TODO: check the correctness
+    '''
+    logits = end_points['valid_logits']
+    labels = end_points['valid_labels']
+    logits = logits.max(dim=1)[1]
+    acc = (logits == labels).sum().float() / float(labels.shape[0])
+    end_points['acc'] = acc
+    return acc, end_points
+
+class IoUCalculator:
+    '''
+    copy from RandLANet
+    TODO: check the correctness
+    '''
+    def __init__(self, cfg):
+        self.gt_classes = [0 for _ in range(cfg.num_classes)]
+        self.positive_classes = [0 for _ in range(cfg.num_classes)]
+        self.true_positive_classes = [0 for _ in range(cfg.num_classes)]
+        self.cfg = cfg
+
+    def add_data(self, end_points):
+        logits = end_points['valid_logits']
+        labels = end_points['valid_labels']
+        pred = logits.max(dim=1)[1]
+        pred_valid = pred.detach().cpu().numpy()
+        labels_valid = labels.detach().cpu().numpy()
+
+        val_total_correct = 0
+        val_total_seen = 0
+
+        correct = np.sum(pred_valid == labels_valid)
+        val_total_correct += correct
+        val_total_seen += len(labels_valid)
+
+        conf_matrix = confusion_matrix(labels_valid, pred_valid, np.arange(0, self.cfg.num_classes, 1))
+        self.gt_classes += np.sum(conf_matrix, axis=1)
+        self.positive_classes += np.sum(conf_matrix, axis=0)
+        self.true_positive_classes += np.diagonal(conf_matrix)
+
+    def compute_iou(self):
+        iou_list = []
+        for n in range(0, self.cfg.num_classes, 1):
+            if float(self.gt_classes[n] + self.positive_classes[n] - self.true_positive_classes[n]) != 0:
+                iou = self.true_positive_classes[n] / float(self.gt_classes[n] + self.positive_classes[n] - self.true_positive_classes[n])
+                iou_list.append(iou)
+            else:
+                iou_list.append(0.0)
+        mean_iou = sum(iou_list) / float(self.cfg.num_classes)
+        return mean_iou, iou_list
+
+def get_loss(logits, labels, pre_cal_weights):
+    '''
+    copy from RandLANet
+    TODO: check the correctness
+    '''
+    # calculate the weighted cross entropy according to the inverse frequency
+    class_weights = torch.from_numpy(pre_cal_weights).float().to(logits.device)
+    # one_hot_labels = F.one_hot(labels, self.config.num_classes)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, reduction='none')
+    output_loss = criterion(logits, labels)
+    output_loss = output_loss.mean()
+    return output_loss
+
+def compute_loss(end_points, cfg):
+    '''
+    copy from RandLANet
+    TODO: check the correctness
+    '''
+
+    logits = end_points['logits']
+    labels = end_points['labels']
+    logits = logits.transpose(1, 2).reshape(-1, cfg.num_classes)
+    labels = labels.reshape(-1)
+
+    # Boolean mask of points that should be ignored
+    ignored_bool = labels == 0
+    for ign_label in cfg.ignored_label_inds:
+        ignored_bool = ignored_bool | (labels == ign_label)
+
+    # Collect logits and labels that are not ignored
+    valid_idx = ignored_bool == 0
+    valid_logits = logits[valid_idx, :]
+    valid_labels_init = labels[valid_idx]
+
+    # Reduce label values in the range of logit shape
+    reducing_list = torch.range(0, cfg.num_classes).long().to(logits.device)
+    inserted_value = torch.zeros((1,)).long().to(logits.device)
+    for ign_label in cfg.ignored_label_inds:
+        reducing_list = torch.cat([reducing_list[:ign_label], inserted_value, reducing_list[ign_label:]], 0)
+    valid_labels = torch.gather(reducing_list, 0, valid_labels_init)
+    loss = get_loss(valid_logits, valid_labels, cfg.class_weights)
+    end_points['valid_logits'], end_points['valid_labels'] = valid_logits, valid_labels
+    end_points['loss'] = loss
+    return loss, end_points
+########################################################################################################################
+# test each individual function
 pts_xyz = torch.rand(10,1024,3)
 neigh_idx = knn(pts_xyz.transpose(1,2),16) #(10,1024,16)
 vn_pts_xyz = pts_xyz.unsqueeze(dim=-2) #(10, 1024, 1, 3)
@@ -322,12 +549,10 @@ sampled_feature = vn_random_sample(after_block_feature,sample,pool='direct')
 print('direct sampled features',sampled_feature.size())
 sampled_feature = vn_random_sample(after_block_feature,sample_neighbors,pool='average')
 print('averaged sampled features',sampled_feature.size())
-
 nearest_neighbors, sampled_xyz = nearst_neighbor_match(pts_xyz,sample)
 print('nearest neighbor',nearest_neighbors.size())
-interpolation_f = nearest_interpolation(sampled_feature,nearest_neighbors)
+interpolation_f = vn_nearest_interpolation(sampled_feature,nearest_neighbors)
 print('nearest interpolation', interpolation_f.size())
-
 #this mean is over points (instance level)
 interpolation_f_mean_tile = interpolation_f.mean(dim=1,keepdim=True).expand(interpolation_f.size())
 print('mean tile',interpolation_f_mean_tile.size())
@@ -336,4 +561,11 @@ invariant_f, z0 = std(torch.cat((interpolation_f,interpolation_f_mean_tile),dim=
 print('invariant f',invariant_f.size())
 invariant_f = invariant_f.flatten(2)
 print('invariant f',invariant_f.size())
-# todo for downsteam test
+print('\n')
+#################################################################################################################
+# test VectorNeuron-RandLANet
+xyz = torch.rand(6,2048,3)
+#color = torch.rand(6,1024,3)
+end_points = preprocess_data(xyz,color=None)
+network = Network(ConfigSemanticKitti())
+end_points = network(end_points)
